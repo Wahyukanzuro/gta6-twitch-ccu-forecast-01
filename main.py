@@ -1,263 +1,227 @@
-"""GTA VI launch-day Twitch CCU forecaster (gta6-twitch-ccu-forecast-01), v1.
+"""Launch-day Twitch-viewer forecaster (v2).
 
-Forecasts, for each of hours 2..24 of a game's UTC release day, five quantiles
-(5/25/50/75/95%) of the Twitch category's concurrent viewers, from the case's
-hour-1 print and the release-day curves of past big launches.
+Reads one case file (schema makefun/twitch-ccu-case/v1) from the input dir
+and writes one forecast file per case to the output dir: 23 rows (hours 2-24),
+five quantiles each (levels 0.05/0.25/0.5/0.75/0.95).
 
-Method -- ratio-curve ensemble, fitted at runtime from the case's own
-comparables (nothing is hardcoded: no fitted tables, no practice answers):
-  1. Each comparable launch contributes its release-day curve normalised by
-     its own hour-0 viewers: r_h = viewers(h) / viewers(0), h = 1..23.
-     The comparable that is the target game's own pre-release history
-     ("Not a launch") is left out, as is any launch with no hour-0 point.
-  2. Each comparable is weighted by similarity to the target case:
-     a Gaussian kernel on log hour-0 viewers (bandwidth 1.25 in log units --
-     launches of the target's scale matter most), x1.5 for rolling-midnight
-     unlocks, x1.5 for PS5-only launches. GTA VI is a console-only
-     rolling-midnight launch, so those two boosts point at its kin.
-  3. Per hour, the forecast is hour-1 print x the weighted median ratio;
-     the five quantiles are the weighted empirical quantiles of the ratio
-     distribution at that hour (honest pinball spreads: wider where the
-     comparables disagree, e.g. the evening peak).
-  4. An hour with fewer than 3 usable ratio curves falls back to the house
-     persistence baseline (spread widening like a random walk in log space).
+Model (fitted at runtime from the case's own comparables only; nothing is
+hardcoded, no table is baked in):
+- Each comparable launch contributes a ratio curve r_d = viewers(day hour d) /
+  viewers(day hour 0). A comparable with no day-hour-0 value (e.g. a
+  pre-release history that is not a launch day) is skipped automatically.
+- Similarity weight per comparable: Gaussian kernel on log hour-0 viewers
+  (bandwidth 1.5) x 1.5 for rolling-midnight unlocks x 1.5 for console-only
+  launches x 0.3 for early-access-contaminated launches.
+- Two estimators per day-hour, blended 75/25 in log space:
+  (a) a local weighted least-squares fit of log ratio on log hour-0 viewers,
+      evaluated at the target's log hour-1 print (the target's log print is
+      clamped to the fitted launches' range, so a record print cannot drive
+      the line off a cliff), with spreads from the weighted quantiles of the
+      fit residuals;
+  (b) the weighted median ratio and weighted empirical quantiles.
+  Either side falls back to the other when it has too few points.
+- If a day-hour has no usable comparable at all, the house persistence
+  baseline is used for that hour.
+- The live streams / categories fields of a case are intentionally NOT used:
+  they are null in every practice case, so no adjustment based on them could
+  be validated; the forecast anchors on the hour-1 print and the comparables.
 
-What was tested and rejected (leave-one-out over the 37 comparable launches,
-mean pinball loss on the log scale; lower is better):
-  - unweighted median: LOO 0.72 (all launches) / 0.37 (big launches only)
-  - scale-weighted median (this program): 0.41 / 0.26
-  - + hype weighting (pre-release peak / hour-0 similarity): no gain
-  - + a per-hour bias correction from internal-LOO residuals: HURTS (0.30)
-  - lognormal spreads instead of empirical quantiles: worse on big launches
-  Practice (4 real launches, local scorer): mean loss 0.246, vs the house
-  baseline's 0.387; typical miss 47%, 90% coverage 0.935.
-
-The final case's `streams` and `categories_hourly` fields are parsed but do
-not move the v1 forecast: they are null in every practice case, so any
-adjustment from them would be untested guesswork. The validated model is the
-ensemble plus the hour-1 anchor.
-
-Runtime: standard library only, no network, no randomness, deterministic
-(comparables sorted by name; every reduction in a fixed order). Runs in well
-under a second per case on one CPU.
+Standard library only. Deterministic: fixed iteration orders, no randomness.
 """
-
 import json
 import math
 import os
-import sys
 from datetime import datetime
-from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so a module
-# shipped beside this file would import. (This entry is a single file.)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-# The quantile levels the contest scores, in the order each row lists them.
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level (baseline fallback only).
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-# The persistence baseline's spread, in log units per square-root hour
-# (used only when an hour has too few ratio curves to trust the ensemble).
-BASE_SIGMA = 0.15
-# Log-scale bandwidth of the similarity kernel on hour-0 viewers.
-SCALE_BW = 1.25
-# Multipliers for comparables that share the target's launch shape.
-UNLOCK_BOOST = 1.5
-CONSOLE_BOOST = 1.5
-# Minimum usable ratio curves for an hour before falling back to baseline.
-MIN_RATIOS = 3
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+BW = 1.5
+BLEND_W = 0.75
+MIN_REGRESS = 8
+MIN_MEDIAN = 3
 
 
-def round2(x):
-    """Round x to 2 decimals, half up (as JavaScript Math.round(x*100)/100).
-
-    Whole numbers come back as ints so the JSON writes 1240, not 1240.0.
-    """
-    scaled = float(x) * 100.0
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100.0
-    return int(value) if value.is_integer() else value
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def parse_ts(text):
-    """Parse an ISO 8601 UTC timestamp into a datetime."""
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+def is_rolling(unlock):
+    u = (unlock or "").lower()
+    return ("rolling" in u) or ("midnight local" in u)
 
 
-class Comparable:
-    """One past launch's release-day curve, from the case's comparables."""
-
-    def __init__(self, raw):
-        self.name = raw.get("name", "")
-        self.unlock = (raw.get("unlock") or "").lower()
-        self.platforms = (raw.get("platforms") or "").lower()
-        self.day_start = parse_ts(raw["day_start"])
-        self.hourly = {}
-        for point in raw.get("hourly") or []:
-            try:
-                when = parse_ts(point["from"])
-                viewers = float(point["viewers"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            delta_h = (when - self.day_start).total_seconds() / 3600.0
-            if 0.0 <= delta_h < 24.0:
-                self.hourly[int(delta_h)] = viewers
-
-    @property
-    def hour0(self):
-        """Viewers in the release day's first hour (the anchor)."""
-        return self.hourly.get(0)
-
-    def ratio(self, day_hour):
-        """Viewers at day hour h divided by viewers at hour 0, or None."""
-        anchor = self.hourly.get(0)
-        value = self.hourly.get(day_hour)
-        if anchor is None or value is None or anchor <= 0 or value < 0:
-            return None
-        return value / anchor
-
-    def is_launch(self):
-        """False for the target's own pre-release history (not a launch)."""
-        return "not a launch" not in self.unlock
-
-    def is_rolling_midnight(self):
-        return ("rolling" in self.unlock) or ("midnight local" in self.unlock)
-
-    def is_console_only(self):
-        return "ps5 only" in self.platforms
+def is_early(unlock):
+    return "early-access-contaminated" in (unlock or "").lower()
 
 
-def similarity(comp, p1):
-    """Weight of one comparable for a target whose hour-1 print is p1."""
-    anchor = comp.hour0
-    if anchor is None or anchor <= 0 or p1 <= 0:
+def is_console_only(platforms):
+    return "ps5 only" in (platforms or "").lower()
+
+
+def weight(launch, target_h0):
+    h0 = launch["h0"]
+    if h0 is None or h0 <= 0:
         return 0.0
-    gap = math.log(anchor) - math.log(p1)
-    weight = math.exp(-0.5 * (gap / SCALE_BW) ** 2)
-    if comp.is_rolling_midnight():
-        weight *= UNLOCK_BOOST
-    if comp.is_console_only():
-        weight *= CONSOLE_BOOST
-    return weight
+    d = abs(math.log(h0) - math.log(max(target_h0, 1)))
+    w = math.exp(-0.5 * (d / BW) ** 2)
+    if is_rolling(launch["unlock"]):
+        w *= 1.5
+    if is_console_only(launch["platforms"]):
+        w *= 1.5
+    if is_early(launch["unlock"]):
+        w *= 0.3
+    return w
 
 
-def weighted_quantiles(pairs, levels):
-    """Weighted empirical quantiles of (value, weight) pairs.
-
-    Linear interpolation on the weighted cumulative distribution.
-    """
+def wquantiles(pairs, levels):
+    """Weighted empirical quantiles (type-7 style on the weighted CDF)."""
     pairs = sorted(pairs)
-    total = sum(w for _, w in pairs)
-    if total <= 0 or not pairs:
+    tot = sum(w for _, w in pairs)
+    if tot <= 0 or not pairs:
         return None
     cum = []
-    running = 0.0
-    for _, w in pairs:
-        running += w
-        cum.append(running / total)
-    out = []
-    for level in levels:
-        if level <= cum[0]:
-            out.append(pairs[0][0])
+    s = 0.0
+    for v, w in pairs:
+        s += w
+        cum.append(s / tot)
+    res = []
+    for lv in levels:
+        if lv <= cum[0]:
+            res.append(pairs[0][0])
             continue
-        if level >= cum[-1]:
-            out.append(pairs[-1][0])
+        if lv >= cum[-1]:
+            res.append(pairs[-1][0])
             continue
         for i in range(1, len(pairs)):
-            if cum[i] >= level:
+            if cum[i] >= lv:
                 c0, c1 = cum[i - 1], cum[i]
                 v0, v1 = pairs[i - 1][0], pairs[i][0]
-                frac = 0.0 if c1 == c0 else (level - c0) / (c1 - c0)
-                out.append(v0 + frac * (v1 - v0))
+                t = 0.0 if c1 == c0 else (lv - c0) / (c1 - c0)
+                res.append(v0 + t * (v1 - v0))
                 break
+    return res
+
+
+def load_launches(case):
+    """Comparables as {h0, hourly {day-hour: viewers}, unlock, platforms}.
+    Only day hours 0..23 count; a comparable without a day-hour-0 value is
+    skipped (this also drops pre-release histories, which are not launches)."""
+    out = []
+    for c in case.get("comparables") or []:
+        ds = parse_ts(c["day_start"])
+        hourly = {}
+        for h in c.get("hourly") or []:
+            t = parse_ts(h["from"])
+            dh = (t - ds).total_seconds() / 3600.0
+            if 0 <= dh < 24:
+                v = h.get("viewers")
+                if v is not None:
+                    hourly[int(dh)] = v
+        h0 = hourly.get(0)
+        if h0 is None or h0 <= 0:
+            continue
+        out.append({"h0": h0, "hourly": hourly,
+                    "unlock": c.get("unlock") or "",
+                    "platforms": c.get("platforms") or ""})
     return out
 
 
-def baseline_quantiles(p1, hour):
-    """House persistence forecast for one hour (fallback only)."""
-    return [round2(p1 * math.exp(z * BASE_SIGMA * math.sqrt(hour - 1))) for z in Z]
-
-
-def forecast_case(case, name):
-    """Forecast one case: 23 rows (hours 2..24) of five quantiles each."""
-    if case.get("levels") != LEVELS:
-        raise ValueError(f"{name} asks for levels {case.get('levels')}, not {LEVELS}")
-    first = next((k for k in case.get("known", []) if k.get("hour") == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1.0, float(first["viewers"]))
-
-    # The final case carries live top streams and category rankings; v1 parses
-    # them (so the final's shape never breaks the run) but does not let them
-    # move the forecast -- they are null in every practice case, so any
-    # adjustment from them would be untested. See the module docstring.
-    _streams = case.get("streams")
-    _categories = case.get("categories_hourly")
-    _ = (_streams, _categories)
-
-    comparables = []
-    for raw in case.get("comparables") or []:
-        try:
-            comp = Comparable(raw)
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not comp.is_launch():
-            continue
-        if comp.hour0 is None or comp.hour0 <= 0:
-            continue
-        comparables.append(comp)
-    comparables.sort(key=lambda c: c.name)
-
-    rows = []
-    for row in case.get("forecast", []):
-        hour = int(row["hour"])
-        day_hour = hour - 1  # case hour h is the day's hour h-1 (0-based)
-        pairs = []
-        for comp in comparables:
-            ratio = comp.ratio(day_hour)
-            if ratio is None or ratio <= 0:
+def predict_day(launches, p1):
+    """{day-hour: [q05..q95] ratios} for day hours 0..23, or None per hour."""
+    xt = math.log(max(p1, 1))
+    res = {}
+    for d in range(0, 24):
+        pts = []
+        for launch in launches:
+            if d not in launch["hourly"]:
                 continue
-            weight = similarity(comp, p1)
-            if weight > 0:
-                pairs.append((ratio, weight))
-        if len(pairs) >= MIN_RATIOS:
-            quantiles = weighted_quantiles(pairs, LEVELS)
-            values = [round2(p1 * q) for q in quantiles]
+            v = launch["hourly"][d]
+            if v is None or v <= 0:
+                continue
+            w = weight(launch, p1)
+            if w <= 0:
+                continue
+            pts.append((math.log(launch["h0"]), math.log(v / launch["h0"]), w))
+        reg = None
+        if len(pts) >= MIN_REGRESS:
+            xs = [x for x, _, _ in pts]
+            xc = min(max(xt, min(xs)), max(xs))
+            sw = sum(w for _, _, w in pts)
+            mx = sum(w * x for x, _, w in pts) / sw
+            my = sum(w * y for _, y, w in pts) / sw
+            sxx = sum(w * (x - mx) ** 2 for x, _, w in pts)
+            b = 0.0
+            if sxx > 1e-12:
+                sxy = sum(w * (x - mx) * (y - my) for x, y, w in pts)
+                b = sxy / sxx
+            a = my - b * mx
+            mu = a + b * xc
+            resid = [(y - (a + b * x), w) for x, y, w in pts]
+            qs = wquantiles(resid, LEVELS)
+            if qs is not None:
+                reg = sorted(math.exp(mu + e) for e in qs)
+        pairs = []
+        for launch in launches:
+            if d not in launch["hourly"]:
+                continue
+            v = launch["hourly"][d]
+            if v is None or v <= 0:
+                continue
+            w = weight(launch, p1)
+            if w <= 0:
+                continue
+            pairs.append((v / launch["h0"], w))
+        med = None
+        if len(pairs) >= MIN_MEDIAN:
+            qs = wquantiles(pairs, LEVELS)
+            if qs is not None:
+                med = sorted(qs)
+        if reg is None and med is None:
+            res[d] = None
+        elif med is None:
+            res[d] = reg
+        elif reg is None:
+            res[d] = med
         else:
-            values = baseline_quantiles(p1, hour)
-        # Enforce the output contract: finite, above 0, at most 1e9,
-        # non-decreasing across the five levels.
-        fixed = []
-        prev = 0.0
-        for value in values:
-            v = float(value)
-            if not math.isfinite(v) or v <= 0:
-                v = prev if prev > 0 else 1.0
-            if v > 1e9:
-                v = 1e9
-            if v < prev:
-                v = prev
-            fixed.append(round2(v))
-            prev = float(fixed[-1])
-        rows.append({"hour": hour, "q": fixed})
+            res[d] = sorted(math.exp(BLEND_W * math.log(r) + (1.0 - BLEND_W) * math.log(m))
+                            for r, m in zip(reg, med))
+    return res
+
+
+def forecast(case):
+    p1 = 1
+    for k in case.get("known") or []:
+        if k.get("hour") == 1 and k.get("viewers"):
+            p1 = max(1, k["viewers"])
+    launches = load_launches(case)
+    day = predict_day(launches, p1)
+    rows = []
+    for h in range(2, 25):
+        ratios = day.get(h - 1)
+        if ratios is None:
+            qs = [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z]
+        else:
+            qs = [p1 * r for r in ratios]
+        qs = [round(max(min(q, 1e9), 0.01), 2) for q in qs]
+        for i in range(1, 5):
+            if qs[i] < qs[i - 1]:
+                qs[i] = qs[i - 1]
+        rows.append({"hour": h, "q": qs})
     return {"hours": rows}
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
+    for name in names:
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as f:
+            case = json.load(f)
+        out = forecast(case)
+        stem = name[:-3]
+        with open(os.path.join(out_dir, stem + ".out"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(out, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":
